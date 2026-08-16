@@ -1,27 +1,3 @@
---[[
-    Dex SaveInstance Serializer
-    Potassium compatibility update + known issue fixes
-
-    Potassium-specific:
-    - request()
-    - writefile()
-    - appendfile()
-    - gethiddenproperty()
-    - getnilinstances()
-    - setrbxclipboard()
-    - crypt.base64encode()
-    - crypt.hash()
-    - lz4compress()
-    - Drawing.new()
-
-    Fixes:
-    - XML Axes closing tag typo
-    - XML hidden/non-scriptable properties work from Full API metadata
-    - BinaryString handling uses Potassium hidden-property access
-    - Color3uint8 is validated instead of blindly assumed
-    - No Elysian-specific decompile path
-]]
-
 local Main, Serializer, API, Settings, DefaultSettings, env
 
 local service = setmetatable({}, {
@@ -48,6 +24,7 @@ DefaultSettings = {
 		Binary = true,
 		Callback = false,
 		Clipboard = false,
+		Compression = true,
 	},
 }
 
@@ -83,6 +60,7 @@ Serializer = (function()
 	local unpack = unpack
 	local split = string.split
 	local s_rep = string.rep
+	local bufferLib = type(buffer) == "table" and buffer or nil
 
 	local nilSafe = {}
 	local gameId
@@ -150,6 +128,197 @@ Serializer = (function()
 		["&"] = "&amp;",
 		["\0"] = "",
 	}
+
+	----------------------------------------------------------------
+	-- 2026 VALUE HELPERS
+	----------------------------------------------------------------
+
+	local function bufferString(size, writer)
+		if not bufferLib then
+			return nil
+		end
+
+		local b = bufferLib.create(size)
+
+		writer(b)
+
+		return bufferLib.tostring(b)
+	end
+
+	local function normalize16ByteHash(hash)
+		if type(hash) ~= "string" then
+			return nil
+		end
+
+		if #hash == 16 then
+			return hash
+		end
+
+		if #hash == 32 and hash:match("^[0-9a-fA-F]+$") then
+			local out = tableCreate(16)
+
+			for i = 1, 32, 2 do
+				out[#out + 1] = string.char(tonumber(hash:sub(i, i + 1), 16))
+			end
+
+			return concat(out)
+		end
+
+		return nil
+	end
+
+	local function i64ToString(value)
+		if type(value) ~= "number" then
+			return "0"
+		end
+
+		return format("%.0f", value)
+	end
+
+	local function getSecurityCapabilityMask(value)
+		-- Matches the current UniversalSynSaveInstance capability layout.
+		local bits = {
+			Plugin = 2 ^ 0,
+			LocalUser = 2 ^ 1,
+			WritePlayer = 2 ^ 2,
+			RobloxScript = 2 ^ 3,
+			RobloxEngine = 2 ^ 4,
+			NotAccessible = 2 ^ 5,
+			RunClientScript = 2 ^ 8,
+			RunServerScript = 2 ^ 9,
+			Unknown = 2 ^ 10,
+			AccessOutsideWrite = 2 ^ 11,
+			Unassigned = 2 ^ 15,
+			LoadUnownedAsset = 2 ^ 16,
+			LoadString = 2 ^ 17,
+			ScriptGlobals = 2 ^ 18,
+			CreateInstances = 2 ^ 19,
+			Basic = 2 ^ 20,
+			Audio = 2 ^ 21,
+			DataStore = 2 ^ 22,
+			Network = 2 ^ 23,
+			Physics = 2 ^ 24,
+			UI = 2 ^ 25,
+			CSG = 2 ^ 26,
+			Chat = 2 ^ 27,
+			Animation = 2 ^ 28,
+			AvatarAppearance = 2 ^ 29,
+			Input = 2 ^ 30,
+			Environment = 2 ^ 31,
+			RemoteEvent = 2 ^ 32,
+			LegacySound = 2 ^ 33,
+			Players = 2 ^ 34,
+			CapabilityControl = 2 ^ 35,
+			AssetRead = 2 ^ 36,
+			AssetManagement = 2 ^ 37,
+			DynamicGeneration = 2 ^ 38,
+			PlatformAvatarEditing = 2 ^ 39,
+			AssetCreateUpdate = 2 ^ 40,
+			Capture = 2 ^ 41,
+			SensitiveInput = 2 ^ 42,
+			Monetization = 2 ^ 43,
+			LoadOwnedAsset = 2 ^ 44,
+			Social = 2 ^ 45,
+			ServerCommunication = 2 ^ 46,
+			Logging = 2 ^ 47,
+			PromptExternalPurchase = 2 ^ 48,
+			Groups = 2 ^ 49,
+			Teleport = 2 ^ 50,
+			Consequences = 2 ^ 51,
+			Material = 2 ^ 52,
+			AvatarBehavior = 2 ^ 53,
+			RemoteCommand = 2 ^ 59,
+			InternalTest = 2 ^ 60,
+			PluginOrOpenCloud = 2 ^ 61,
+			Assistant = 2 ^ 62,
+			Restricted = 2 ^ 63,
+		}
+
+		local mask = 0
+
+		for flag in tostring(value):gmatch("[^|]+") do
+			flag = flag:gsub("^%s+", ""):gsub("%s+$", "")
+
+			local bit = bits[flag]
+
+			if bit then
+				mask = mask + bit
+			end
+		end
+
+		return mask
+	end
+
+	local function getHiddenValue(obj, prop)
+		if not gethiddenprop then
+			return nil
+		end
+
+		local ok, value = pcall(gethiddenprop, obj, prop)
+
+		if ok then
+			return value
+		end
+
+		return nil
+	end
+
+	local function readProperty(obj, prop)
+		local indexName = prop.IndexName or prop.Name
+
+		if prop.Special == "Func" and prop.Func then
+			local ok, value = pcall(prop.Func, obj)
+
+			return ok and value or nil
+		end
+
+		local typeName = prop.ValueType and prop.ValueType.Name
+
+		if prop.Special == "Decompile" then
+			return nil
+		end
+
+		if prop.Special == "BinaryString" then
+			if getbspval then
+				local ok, value = pcall(getbspval, obj, indexName, false)
+
+				if ok then
+					return value
+				end
+			end
+
+			return getHiddenValue(obj, indexName)
+		end
+
+		if
+			(prop.Tags and prop.Tags.NotScriptable)
+			or typeName == "SharedString"
+			or typeName == "Color3uint8"
+			or typeName == "Vector3int16"
+			or typeName == "SecurityCapabilities"
+			or typeName == "Bytecode"
+		then
+			local value = getHiddenValue(obj, indexName)
+
+			if value ~= nil then
+				return value
+			end
+		end
+
+		if oldIndex then
+			local ok, value = pcall(oldIndex, obj, indexName)
+
+			if ok then
+				return value
+			end
+		end
+
+		local ok, value = pcall(function()
+			return obj[indexName]
+		end)
+
+		return ok and value or nil
+	end
 
 	local serviceBlacklist = {
 		["CoreGui"] = true,
@@ -303,14 +472,23 @@ Serializer = (function()
 
 		["PhysicalProperties"] = function(name, val)
 			if val then
+				local ok, absorption = pcall(function()
+					return val.AcousticAbsorption
+				end)
+
+				if not ok or type(absorption) ~= "number" then
+					absorption = 1
+				end
+
 				return format(
-					'\n<PhysicalProperties name="%s">\n<CustomPhysics>true</CustomPhysics>\n<Density>%.12f</Density>\n<Friction>%.12f</Friction>\n<Elasticity>%.12f</Elasticity>\n<FrictionWeight>%.12f</FrictionWeight>\n<ElasticityWeight>%.12f</ElasticityWeight>\n</PhysicalProperties>',
+					'\n<PhysicalProperties name="%s">\n<CustomPhysics>true</CustomPhysics>\n<Density>%.12f</Density>\n<Friction>%.12f</Friction>\n<Elasticity>%.12f</Elasticity>\n<FrictionWeight>%.12f</FrictionWeight>\n<ElasticityWeight>%.12f</ElasticityWeight>\n<AcousticAbsorption>%.12f</AcousticAbsorption>\n</PhysicalProperties>',
 					name,
 					val.Density,
 					val.Friction,
 					val.Elasticity,
 					val.FrictionWeight,
-					val.ElasticityWeight
+					val.ElasticityWeight,
+					absorption
 				)
 			end
 
@@ -359,7 +537,9 @@ Serializer = (function()
 				return ""
 			end
 
-			return '\n<BinaryString name="' .. name .. '"><![CDATA[' .. val .. "]]></BinaryString>"
+			local encoded = encodeBase64 and encodeBase64(val) or val
+
+			return '\n<BinaryString name="' .. name .. '">' .. encoded .. "</BinaryString>"
 		end,
 
 		["ProtectedString"] = function(name, val)
@@ -375,7 +555,100 @@ Serializer = (function()
 		end,
 
 		["SharedString"] = function(name, val)
-			return '\n<SharedString name="' .. name .. '">' .. val .. "</SharedString>"
+			return '\n<SharedString name="' .. name .. '">' .. tostring(val or "") .. "</SharedString>"
+		end,
+
+		["UniqueId"] = function(name, val)
+			local ok, index, timeValue, randomValue = pcall(function()
+				return val.Index, val.Time, val.Random
+			end)
+
+			if not ok then
+				return ""
+			end
+
+			local okBytes, bytes = pcall(function()
+				return s_pack("<I4I4i8", index, timeValue, randomValue)
+			end)
+
+			if not okBytes then
+				return ""
+			end
+
+			local hex = bytes:gsub(".", function(c)
+				return format("%02x", string.byte(c))
+			end)
+
+			return format('\\n<UniqueId name="%s">%s</UniqueId>', name, hex)
+		end,
+
+		["SecurityCapabilities"] = function(name, val)
+			return format(
+				'\\n<SecurityCapabilities name="%s">%s</SecurityCapabilities>',
+				name,
+				i64ToString(getSecurityCapabilityMask(val))
+			)
+		end,
+
+		["Content"] = function(name, val)
+			local sourceType = val and val.SourceType
+
+			if sourceType == Enum.ContentSourceType.None then
+				return format('\\n<Content name="%s"><null></null></Content>', name)
+			elseif sourceType == Enum.ContentSourceType.Uri then
+				local uri = val.Uri or ""
+				return format(
+					'\\n<Content name="%s"><uri>%s</uri></Content>',
+					name,
+					gsub(tostring(uri), xmlReplacePattern, xmlReplace)
+				)
+			end
+
+			return ""
+		end,
+
+		["Path2DControlPoint"] = function(name, val)
+			if not val then
+				return ""
+			end
+
+			local p = val.Position
+			local l = val.LeftTangent
+			local r = val.RightTangent
+
+			return format(
+				'\\n<Path2DControlPoint name="%s"><Position><XS>%.12f</XS><XO>%d</XO><YS>%.12f</YS><YO>%d</YO></Position><LeftTangent><XS>%.12f</XS><XO>%d</XO><YS>%.12f</YS><YO>%d</YO></LeftTangent><RightTangent><XS>%.12f</XS><XO>%d</XO><YS>%.12f</YS><YO>%d</YO></RightTangent></Path2DControlPoint>',
+				name,
+				p.X.Scale,
+				p.X.Offset,
+				p.Y.Scale,
+				p.Y.Offset,
+				l.X.Scale,
+				l.X.Offset,
+				l.Y.Scale,
+				l.Y.Offset,
+				r.X.Scale,
+				r.X.Offset,
+				r.Y.Scale,
+				r.Y.Offset
+			)
+		end,
+
+		["TweenInfo"] = function(name, val)
+			if not val then
+				return ""
+			end
+
+			return format(
+				'\\n<TweenInfo name="%s"><Time>%.12f</Time><DelayTime>%.12f</DelayTime><RepeatCount>%d</RepeatCount><EasingStyle>%d</EasingStyle><EasingDirection>%d</EasingDirection><Reverses>%s</Reverses></TweenInfo>',
+				name,
+				val.Time,
+				val.DelayTime,
+				val.RepeatCount,
+				val.EasingStyle.Value,
+				val.EasingDirection.Value,
+				val.Reverses and "true" or "false"
+			)
 		end,
 
 		["Color3uint8"] = function(name, val)
@@ -434,8 +707,13 @@ Serializer = (function()
 		["Color3uint8"] = "\26",
 		["int64"] = "\27",
 		["SharedString"] = "\28",
+		["NetAssetRef"] = "\28",
+		["Bytecode"] = "\29",
 		["OptionalCoordinateFrame"] = "\30",
+		["UniqueId"] = "\31",
 		["Font"] = "\32",
+		["SecurityCapabilities"] = "\33",
+		["Content"] = "\34",
 	}
 
 	local binaryCFrameMap = {
@@ -1110,15 +1388,33 @@ Serializer = (function()
 				end
 
 				if val then
-					result[i] = "\1"
-						.. s_pack(
-							"<fffff",
-							val.Density,
-							val.Friction,
-							val.Elasticity,
-							val.FrictionWeight,
-							val.ElasticityWeight
-						)
+					local ok, absorption = pcall(function()
+						return val.AcousticAbsorption
+					end)
+
+					if not ok or type(absorption) ~= "number" then
+						absorption = 1
+						result[i] = "\1"
+							.. s_pack(
+								"<fffff",
+								val.Density,
+								val.Friction,
+								val.Elasticity,
+								val.FrictionWeight,
+								val.ElasticityWeight
+							)
+					else
+						result[i] = "\3"
+							.. s_pack(
+								"<ffffff",
+								val.Density,
+								val.Friction,
+								val.Elasticity,
+								val.FrictionWeight,
+								val.ElasticityWeight,
+								absorption
+							)
+					end
 				else
 					result[i] = "\0"
 				end
@@ -1138,12 +1434,12 @@ Serializer = (function()
 
 				if func then
 					val = func(objs[i], name)
-				elseif gethiddenprop then
-					val = gethiddenprop(objs[i], name)
-				elseif oldIndex then
-					val = oldIndex(objs[i], name)
 				else
-					val = objs[i][name]
+					val = getHiddenValue(objs[i], name)
+
+					if val == nil and oldIndex then
+						val = oldIndex(objs[i], name)
+					end
 				end
 
 				if not val then
@@ -1158,12 +1454,17 @@ Serializer = (function()
 					return nil
 				end
 
+				-- gethiddenproperty() exposes Color3uint8 as integer channels on
+				-- runtimes that implement the hidden data type. Be permissive and
+				-- also accept normal Color3-style 0..1 channels.
+				local scale = (r <= 1 and g <= 1 and b <= 1) and 255 or 1
+
 				result[i] = "\1"
 					.. s_pack(
 						"<BBB",
-						math.clamp(math.floor(r + 0.5), 0, 255),
-						math.clamp(math.floor(g + 0.5), 0, 255),
-						math.clamp(math.floor(b + 0.5), 0, 255)
+						math.clamp(math.floor(r * scale + 0.5), 0, 255),
+						math.clamp(math.floor(g * scale + 0.5), 0, 255),
+						math.clamp(math.floor(b * scale + 0.5), 0, 255)
 					)
 			end
 
@@ -1276,15 +1577,24 @@ Serializer = (function()
 					val = objs[i][name]
 				end
 
-				local family = s_pack("<I4", #val.Family) .. val.Family
+				if not val then
+					result[i] = s_pack("<I2I1I4", 0, 0, 0)
+				else
+					local family = tostring(val.Family or "")
+					local weightOk, weight = pcall(function()
+						return val.Weight.Value
+					end)
+					local styleOk, style = pcall(function()
+						return val.Style.Value
+					end)
 
-				local weight = s_pack("<I2", val.Weight.Value)
+					local familyBytes = s_pack("<I4", #family) .. family
+					local cached = s_pack("<I4", 0)
 
-				local style = s_pack("<I1", val.Style.Value)
-
-				local cached = "\0\0\0\0"
-
-				result[i] = family .. weight .. style .. cached
+					result[i] = s_pack("<I2I1", weightOk and weight or 0, styleOk and style or 0)
+						.. familyBytes
+						.. cached
+				end
 			end
 
 			return concat(result)
@@ -1681,6 +1991,20 @@ Serializer = (function()
 	-- BINARY SERIALIZER
 	----------------------------------------------------------------
 
+	local function maybeCompress(data, enabled)
+		if not enabled or not lz4compress or type(data) ~= "string" or #data < 64 then
+			return 0, data
+		end
+
+		local ok, compressed = pcall(lz4compress, data)
+
+		if ok and type(compressed) == "string" and #compressed > 0 and #compressed < #data then
+			return #compressed, compressed
+		end
+
+		return 0, data
+	end
+
 	local function serializeBinary(root, filename, saveSettings)
 		local header = {
 			"\60\114\111\98\108\111\120\33\137\255\13\10\26\10\0\0",
@@ -1927,9 +2251,17 @@ Serializer = (function()
 
 							local success, inst = pcall(Instance.new, class)
 
-							if success and not pcall(function()
-								inst.Parent = folder
-							end) then
+							if success then
+								if not pcall(function()
+									inst.Parent = folder
+								end) then
+									isNilSafe = false
+								end
+
+								pcall(function()
+									inst:Destroy()
+								end)
+							else
 								isNilSafe = false
 							end
 
@@ -1984,7 +2316,7 @@ Serializer = (function()
 		end
 
 		local sharedStringHandler = function(objs, name)
-			if not gethiddenprop then
+			if not gethiddenprop and not getbspval then
 				return
 			end
 
@@ -1992,7 +2324,7 @@ Serializer = (function()
 				sharedStringCount = 1
 
 				sharedStrings[1] = {
-					"NullSharedString",
+					string.rep("\0", 16),
 					"",
 				}
 			end
@@ -2004,22 +2336,31 @@ Serializer = (function()
 			local sep = szObjs - 1
 
 			for i = 1, szObjs do
-				local content = gethiddenprop(objs[i], name)
+				local content = getHiddenValue(objs[i], name)
 
 				if type(content) == "string" and #content > 0 then
-					local hash = content
-
-					local index = hashs[hash]
+					local cacheKey = content
+					local index = hashs[cacheKey]
 
 					if not index then
+						local digest = normalize16ByteHash(hashmd5 and hashmd5(content))
+						local hash = digest
+
+						if not hash then
+							-- The file format needs a stable 16-byte key. If the
+							-- executor doesn't expose MD5, fall back to a unique
+							-- binary key rather than writing the old bogus index
+							-- encoded as a hash.
+							hash = s_pack("<I4I4I4I4", sharedStringCount, #content, 0x53485354, 0x2026)
+						end
+
 						index = sharedStringCount + 1
 
-						hashs[hash] = index
-
+						hashs[cacheKey] = index
 						sharedStringCount = index
 
 						sharedStrings[sharedStringCount] = {
-							s_pack(">I16", sharedStringCount),
+							hash,
 							content,
 						}
 					end
@@ -2110,11 +2451,10 @@ Serializer = (function()
 
 			instHeader[3] = s_pack("<I4", #instChunkData)
 
-			if lz4compress then
-				instChunkData = lz4compress(instChunkData)
+			local compressedLength, compressedData = maybeCompress(instChunkData, saveSettings.Compression)
 
-				instHeader[2] = s_pack("<I4", #instChunkData)
-			end
+			instHeader[2] = s_pack("<I4", compressedLength)
+			instChunkData = compressedData
 
 			instBuf[instBufCount] = concat(instHeader)
 
@@ -2126,6 +2466,11 @@ Serializer = (function()
 
 			for propInd = 1, #props do
 				local prop = props[propInd]
+
+				local propTypeForFile = prop.ValueType and prop.ValueType.Name
+				if propTypeForFile == "UniqueId" and not isGame then
+					continue
+				end
 
 				local propName = prop.Name
 
@@ -2158,14 +2503,24 @@ Serializer = (function()
 
 					propChunkData[3] = binaryDataTypes[propType]
 
-					if not handler then
-						if propType == "SharedString" then
-							handler = sharedStringHandler
-						elseif propType == "ProtectedString" then
-							handler = protectedStringHandler
-
-							propChunkData[3] = binaryDataTypes.string
-						end
+					if propType == "SharedString" or propType == "NetAssetRef" then
+						handler = sharedStringHandler
+						propChunkData[3] = binaryDataTypes.SharedString
+					elseif propType == "ProtectedString" then
+						handler = protectedStringHandler
+						propChunkData[3] = binaryDataTypes.string
+					elseif propType == "Content" then
+						handler = binaryPropHandlers.Content
+						propChunkData[3] = binaryDataTypes.Content
+					elseif propType == "SecurityCapabilities" then
+						handler = binaryPropHandlers.SecurityCapabilities
+						propChunkData[3] = binaryDataTypes.SecurityCapabilities
+					elseif propType == "UniqueId" then
+						handler = binaryPropHandlers.UniqueId
+						propChunkData[3] = binaryDataTypes.UniqueId
+					elseif propType == "Bytecode" then
+						handler = binaryPropHandlers.Bytecode
+						propChunkData[3] = binaryDataTypes.Bytecode
 					end
 				elseif propTypeCategory == "Enum" then
 					handler = binaryPropHandlers.Enum
@@ -2181,17 +2536,30 @@ Serializer = (function()
 					local func
 					local special = prop.Special
 
-					if prop.Tags and prop.Tags.NotScriptable then
-						if getnspval then
-							func = getnspval
-						else
+					if
+						(prop.Tags and prop.Tags.NotScriptable)
+						or propType == "SharedString"
+						or propType == "Color3uint8"
+						or propType == "Vector3int16"
+						or propType == "SecurityCapabilities"
+						or propType == "Bytecode"
+					then
+						if gethiddenprop then
+							func = function(obj, propName)
+								return getHiddenValue(obj, propName)
+							end
+						elseif prop.Tags and prop.Tags.NotScriptable then
 							continue
 						end
 					end
 
 					if special then
 						if special == "NotScriptable" then
-							if getnspval then
+							if gethiddenprop then
+								func = function(obj, propName)
+									return getHiddenValue(obj, propName)
+								end
+							elseif getnspval then
 								func = getnspval
 							else
 								continue
@@ -2213,11 +2581,10 @@ Serializer = (function()
 
 					propHeader[3] = s_pack("<I4", #propChunkData)
 
-					if lz4compress then
-						propChunkData = lz4compress(propChunkData)
+					local compressedLength, compressedData = maybeCompress(propChunkData, saveSettings.Compression)
 
-						propHeader[2] = s_pack("<I4", #propChunkData)
-					end
+					propHeader[2] = s_pack("<I4", compressedLength)
+					propChunkData = compressedData
 
 					propBuf[propBufCount] = concat(propHeader)
 
@@ -2259,11 +2626,10 @@ Serializer = (function()
 
 			sstrHeader[3] = s_pack("<I4", #sstrChunkData)
 
-			if lz4compress then
-				sstrChunkData = lz4compress(sstrChunkData)
+			local compressedLength, compressedData = maybeCompress(sstrChunkData, saveSettings.Compression)
 
-				sstrHeader[2] = s_pack("<I4", #sstrChunkData)
-			end
+			sstrHeader[2] = s_pack("<I4", compressedLength)
+			sstrChunkData = compressedData
 
 			sstrBuf[1] = concat(sstrHeader)
 
@@ -2334,11 +2700,10 @@ Serializer = (function()
 
 		prntHeader[3] = s_pack("<I4", #prntChunkData)
 
-		if lz4compress then
-			prntChunkData = lz4compress(prntChunkData)
+		local compressedLength, compressedData = maybeCompress(prntChunkData, saveSettings.Compression)
 
-			prntHeader[2] = s_pack("<I4", #prntChunkData)
-		end
+		prntHeader[2] = s_pack("<I4", compressedLength)
+		prntChunkData = compressedData
 
 		prntBuf[1] = concat(prntHeader)
 
@@ -2359,8 +2724,12 @@ Serializer = (function()
 		})
 
 		if saveSettings.Clipboard then
-			if type(setrbxclipboard) == "function" then
-				setrbxclipboard(totalData)
+			if env.setrbxclipboard and type(env.setrbxclipboard) == "function" then
+				local ok = pcall(env.setrbxclipboard, totalData)
+
+				if not ok then
+					warn("Potassium: setrbxclipboard failed")
+				end
 			else
 				warn("Potassium: setrbxclipboard unavailable")
 			end
@@ -2429,6 +2798,8 @@ Serializer = (function()
 		local refs = {}
 		local refCount = 1
 		local filter = {}
+		local xmlSharedStrings = {}
+		local xmlSharedStringKeys = {}
 
 		local savingDefaultProps = not saveSettings.IgnoreDefaultProps
 
@@ -2437,6 +2808,30 @@ Serializer = (function()
 		local statusText = saveSettings.ShowStatus and createStatusText()
 
 		local sources = predecompile(root, statusText, saveSettings)
+
+		local function registerXmlSharedString(content)
+			if type(content) ~= "string" or content == "" then
+				return ""
+			end
+
+			local existing = xmlSharedStringKeys[content]
+			if existing then
+				return existing
+			end
+
+			local digest = normalize16ByteHash(hashmd5 and hashmd5(content))
+
+			if not digest then
+				digest = s_pack("<I4I4I4I4", #xmlSharedStrings + 1, #content, 0x53535452, 0x2026)
+			end
+
+			local key = encodeBase64 and encodeBase64(digest) or digest
+
+			xmlSharedStringKeys[content] = key
+			xmlSharedStrings[key] = content
+
+			return key
+		end
 
 		if isGame then
 			for _, v in pairs(service.Players:GetPlayers()) do
@@ -2512,6 +2907,11 @@ Serializer = (function()
 			for i = 1, #props do
 				local prop = props[i]
 
+				local propTypeForFile = prop.ValueType and prop.ValueType.Name
+				if propTypeForFile == "UniqueId" and not isGame then
+					continue
+				end
+
 				local propName = prop.Name
 
 				local indexName = prop.IndexName or propName
@@ -2525,21 +2925,7 @@ Serializer = (function()
 				-- Potassium gethiddenproperty().
 				------------------------------------------------
 
-				if special == "NotScriptable" then
-					if getnspval then
-						propVal = getnspval(obj, indexName)
-					end
-				elseif special == "BinaryString" then
-					if getbspval then
-						propVal = getbspval(obj, indexName, false)
-					end
-				elseif special == "SharedString" then
-					if gethiddenprop then
-						propVal = gethiddenprop(obj, indexName)
-					end
-				elseif special == "Func" then
-					propVal = prop.Func(obj)
-				elseif special == "Decompile" then
+				if special == "Decompile" then
 					if sources[obj] then
 						propVal = sources[obj]
 					elseif not decompileEnabled then
@@ -2547,22 +2933,15 @@ Serializer = (function()
 					else
 						propVal = "-- Script failed to decompile or ignored"
 					end
-				elseif prop.Tags and prop.Tags.NotScriptable then
-					-- FIX:
-					-- Full API + Potassium path for hidden/non-scriptable
-					-- properties that aren't in the legacy specialProps table.
-					if gethiddenprop then
-						propVal = gethiddenprop(obj, indexName)
-					end
+				elseif special == "Func" then
+					propVal = prop.Func(obj)
 				else
-					if oldIndex then
-						propVal = oldIndex(obj, indexName)
-					else
-						local success, value = pcall(function()
-							return obj[indexName]
-						end)
+					propVal = readProperty(obj, prop)
 
-						if success then
+					if propVal == nil and special == "NotScriptable" and getnspval then
+						local ok, value = pcall(getnspval, obj, indexName)
+
+						if ok then
 							propVal = value
 						end
 					end
@@ -2581,7 +2960,35 @@ Serializer = (function()
 
 					local convertFunc = valueConverters[propType]
 
-					if convertFunc and propVal ~= nil then
+					if propType == "SharedString" and type(propVal) == "string" then
+						local key = registerXmlSharedString(propVal)
+						buffer[bufferCount] = format('\n<SharedString name="%s">%s</SharedString>', propName, key)
+					elseif propType == "Content" and propVal ~= nil then
+						local sourceType = propVal.SourceType
+
+						if sourceType == Enum.ContentSourceType.None then
+							buffer[bufferCount] = format('\n<Content name="%s"><null></null></Content>', propName)
+						elseif sourceType == Enum.ContentSourceType.Uri then
+							buffer[bufferCount] = format(
+								'\n<Content name="%s"><uri>%s</uri></Content>',
+								propName,
+								gsub(tostring(propVal.Uri or ""), xmlReplacePattern, xmlReplace)
+							)
+						elseif sourceType == Enum.ContentSourceType.Object and propVal.Object then
+							local refValue = refs[propVal.Object]
+
+							if not refValue then
+								refValue = refCount
+								refs[propVal.Object] = refValue
+								refCount = refCount + 1
+							end
+
+							buffer[bufferCount] =
+								format('\n<Content name="%s"><Ref>RBX%d</Ref></Content>', propName, refValue)
+						else
+							buffer[bufferCount] = ""
+						end
+					elseif convertFunc and propVal ~= nil then
 						buffer[bufferCount] = convertFunc(propName, propVal)
 					elseif typeData.Category == "Enum" and propVal then
 						buffer[bufferCount] = format('\n<token name="%s">%d</token>', propName, propVal.Value)
@@ -2738,6 +3145,14 @@ Serializer = (function()
 
 		bufferCount = bufferCount + 1
 
+		for key, content in next, xmlSharedStrings do
+			local encodedContent = encodeBase64 and encodeBase64(content) or content
+
+			buffer[bufferCount] = format('\n<SharedString md5="%s">%s</SharedString>', key, encodedContent)
+
+			bufferCount = bufferCount + 1
+		end
+
 		buffer[bufferCount] = "\n</SharedStrings>\n</roblox>"
 
 		env.appendfile(filename, table.concat(buffer))
@@ -2812,178 +3227,249 @@ Main = (function()
 	local Main = {}
 
 	Main.FetchAPI = function()
-		-- Potassium-only Full API fetch.
+		local function buildApi(classesRaw, enumsRaw)
+			local classes = {}
+			local enums = {}
 
-		local response = request({
-			Url = "https://raw.githubusercontent.com/MaximumADHD/Roblox-Client-Tracker/refs/heads/roblox/Full-API-Dump.json",
-			Method = "GET",
-		})
+			for _, class in pairs(classesRaw or {}) do
+				local className = class.Name
+				if className then
+					local newClass = {
+						Name = className,
+						Superclass = nil,
+						Properties = {},
+						Functions = {},
+						Events = {},
+						Callbacks = {},
+						Tags = {},
+					}
 
-		if not response then
-			return nil, "Potassium HTTP request failed"
-		end
+					if class.Tags then
+						for _, tag in pairs(class.Tags) do
+							newClass.Tags[tag] = true
+						end
+					end
 
-		local rawAPI = response.Body or response.body or response
+					for _, member in pairs(class.Members or {}) do
+						local newMember = {
+							Name = member.Name,
+							Class = className,
+							Tags = {},
+						}
 
-		if type(rawAPI) ~= "string" then
-			return nil, "Potassium HTTP request returned invalid API data"
-		end
+						if member.Tags then
+							for _, tag in pairs(member.Tags) do
+								newMember.Tags[tag] = true
+							end
+						end
 
-		local success, api = pcall(function()
-			return service.HttpService:JSONDecode(rawAPI)
-		end)
+						local memberType = member.MemberType
 
-		if not success or not api then
-			return nil, "Full API JSON decode failed"
-		end
+						if memberType == "Property" then
+							newMember.ValueType = member.ValueType or {}
+							newMember.Category = member.Category
+							newMember.Serialization = member.Serialization
+							table.insert(newClass.Properties, newMember)
+						elseif memberType == "Function" then
+							newMember.Parameters = {}
+							newMember.ReturnType = member.ReturnType and member.ReturnType.Name
 
-		local classes = {}
-		local enums = {}
+							for _, param in pairs(member.Parameters or {}) do
+								table.insert(newMember.Parameters, {
+									Name = param.Name,
+									Type = param.Type and param.Type.Name or tostring(param.Type),
+								})
+							end
 
-		for _, class in pairs(api.Classes) do
-			local newClass = {}
+							table.insert(newClass.Functions, newMember)
+						elseif memberType == "Event" then
+							newMember.Parameters = {}
 
-			newClass.Name = class.Name
+							for _, param in pairs(member.Parameters or {}) do
+								table.insert(newMember.Parameters, {
+									Name = param.Name,
+									Type = param.Type and param.Type.Name or tostring(param.Type),
+								})
+							end
 
-			newClass.Superclass = classes[class.Superclass]
+							table.insert(newClass.Events, newMember)
+						elseif memberType == "Callback" then
+							newMember.Parameters = {}
+							newMember.ReturnType = member.ReturnType and member.ReturnType.Name
 
-			newClass.Properties = {}
+							for _, param in pairs(member.Parameters or {}) do
+								table.insert(newMember.Parameters, {
+									Name = param.Name,
+									Type = param.Type and param.Type.Name or tostring(param.Type),
+								})
+							end
 
-			newClass.Functions = {}
+							table.insert(newClass.Callbacks, newMember)
+						end
+					end
 
-			newClass.Events = {}
-
-			newClass.Callbacks = {}
-
-			newClass.Tags = {}
-
-			if class.Tags then
-				for _, tag in pairs(class.Tags) do
-					newClass.Tags[tag] = true
+					newClass._SuperclassName = class.Superclass
+					classes[className] = newClass
 				end
 			end
 
-			for _, member in pairs(class.Members) do
-				local newMember = {}
-
-				newMember.Name = member.Name
-
-				newMember.Class = class.Name
-
-				newMember.Tags = {}
-
-				if member.Tags then
-					for _, tag in pairs(member.Tags) do
-						newMember.Tags[tag] = true
-					end
+			for _, class in pairs(classes) do
+				if class._SuperclassName then
+					class.Superclass = classes[class._SuperclassName]
 				end
 
-				local memberType = member.MemberType
+				class._SuperclassName = nil
+			end
 
-				if memberType == "Property" then
-					newMember.ValueType = member.ValueType
+			for _, enum in pairs(enumsRaw or {}) do
+				if enum.Name then
+					local newEnum = {
+						Name = enum.Name,
+						Items = {},
+						Tags = {},
+					}
 
-					newMember.Category = member.Category
+					for _, tag in pairs(enum.Tags or {}) do
+						newEnum.Tags[tag] = true
+					end
 
-					newMember.Serialization = member.Serialization
-
-					table.insert(newClass.Properties, newMember)
-				elseif memberType == "Function" then
-					newMember.Parameters = {}
-
-					newMember.ReturnType = member.ReturnType and member.ReturnType.Name
-
-					for _, param in pairs(member.Parameters or {}) do
-						table.insert(newMember.Parameters, {
-							Name = param.Name,
-							Type = param.Type.Name,
+					for _, item in pairs(enum.Items or {}) do
+						table.insert(newEnum.Items, {
+							Name = item.Name,
+							Value = item.Value,
 						})
 					end
 
-					table.insert(newClass.Functions, newMember)
-				elseif memberType == "Event" then
-					newMember.Parameters = {}
+					enums[enum.Name] = newEnum
+				end
+			end
 
-					for _, param in pairs(member.Parameters or {}) do
-						table.insert(newMember.Parameters, {
-							Name = param.Name,
-							Type = param.Type.Name,
-						})
+			local function getMember(className, memberName)
+				local class = classes[className]
+
+				if not class then
+					return
+				end
+
+				local result = {}
+				local seen = {}
+
+				while class do
+					for _, entry in pairs(class[memberName] or {}) do
+						if not seen[entry.Name] then
+							seen[entry.Name] = true
+							result[#result + 1] = entry
+						end
 					end
 
-					table.insert(newClass.Events, newMember)
-				elseif memberType == "Callback" then
-					newMember.Parameters = {}
-
-					newMember.ReturnType = member.ReturnType and member.ReturnType.Name
-
-					for _, param in pairs(member.Parameters or {}) do
-						table.insert(newMember.Parameters, {
-							Name = param.Name,
-							Type = param.Type.Name,
-						})
-					end
-
-					table.insert(newClass.Callbacks, newMember)
+					class = class.Superclass
 				end
+
+				table.sort(result, function(a, b)
+					return a.Name < b.Name
+				end)
+
+				return result
 			end
 
-			classes[class.Name] = newClass
+			return {
+				Classes = classes,
+				Enums = enums,
+				GetMember = getMember,
+			}
 		end
 
-		for _, enum in pairs(api.Enums) do
-			local newEnum = {}
+		-- First choice in 2026: ReflectionService. It is engine-native and avoids
+		-- transient Full-API dump issues.
+		local reflectionOk, reflectionService = pcall(game.GetService, game, "ReflectionService")
 
-			newEnum.Name = enum.Name
-
-			newEnum.Items = {}
-
-			newEnum.Tags = {}
-
-			if enum.Tags then
-				for _, tag in pairs(enum.Tags) do
-					newEnum.Tags[tag] = true
-				end
-			end
-
-			for _, item in pairs(enum.Items) do
-				table.insert(newEnum.Items, {
-					Name = item.Name,
-					Value = item.Value,
-				})
-			end
-
-			enums[enum.Name] = newEnum
-		end
-
-		local function getMember(class, member)
-			if not classes[class] then
-				return
-			end
-
-			local result = {}
-			local currentClass = classes[class]
-
-			while currentClass do
-				for _, entry in pairs(currentClass[member] or {}) do
-					result[#result + 1] = entry
-				end
-
-				currentClass = currentClass.Superclass
-			end
-
-			table.sort(result, function(a, b)
-				return a.Name < b.Name
+		if reflectionOk and reflectionService then
+			local ok, reflectedClasses = pcall(function()
+				return reflectionService:GetClasses({})
 			end)
 
-			return result
+			if ok and type(reflectedClasses) == "table" and #reflectedClasses > 0 then
+				local rawClasses = {}
+
+				for _, reflectedClass in pairs(reflectedClasses) do
+					local className = reflectedClass.Name
+
+					if className then
+						local rawClass = {
+							Name = className,
+							Superclass = reflectedClass.Superclass
+									and (reflectedClass.Superclass.Name or reflectedClass.Superclass)
+								or nil,
+							Tags = reflectedClass.Tags,
+							Members = {},
+						}
+
+						local propOk, reflectedProps = pcall(function()
+							return reflectionService:GetPropertiesOfClass(className, {})
+						end)
+
+						if propOk then
+							for _, reflectedProp in pairs(reflectedProps or {}) do
+								local member = {
+									Name = reflectedProp.Name,
+									MemberType = "Property",
+									Category = reflectedProp.Category,
+									ValueType = reflectedProp.ValueType,
+									Serialization = reflectedProp.Serialization,
+									Tags = reflectedProp.Tags,
+								}
+
+								table.insert(rawClass.Members, member)
+							end
+						end
+
+						table.insert(rawClasses, rawClass)
+					end
+				end
+
+				local built = buildApi(rawClasses, {})
+
+				if next(built.Classes) then
+					return built
+				end
+			end
 		end
 
-		return {
-			Classes = classes,
-			Enums = enums,
-			GetMember = getMember,
+		local urls = {
+			"https://raw.githubusercontent.com/MaximumADHD/Roblox-Client-Tracker/refs/heads/roblox/Full-API-Dump.json",
+			"https://raw.githubusercontent.com/MaximumADHD/Roblox-Client-Tracker/refs/heads/roblox/API-Dump.json",
 		}
+
+		local lastError = "No API source succeeded"
+
+		for _, url in ipairs(urls) do
+			local okRequest, response = pcall(request, {
+				Url = url,
+				Method = "GET",
+			})
+
+			if okRequest and response then
+				local rawAPI = response.Body or response.body or response
+
+				if type(rawAPI) == "string" then
+					local success, api = pcall(function()
+						return service.HttpService:JSONDecode(rawAPI)
+					end)
+
+					if success and api and type(api.Classes) == "table" then
+						return buildApi(api.Classes, api.Enums)
+					end
+
+					lastError = "API JSON decode failed: " .. url
+				else
+					lastError = "API HTTP response had no string body: " .. url
+				end
+			else
+				lastError = "request() failed: " .. url
+			end
+		end
+
+		return nil, lastError
 	end
 
 	Main.ResetSettings = function()
@@ -3043,18 +3529,20 @@ return {
 		env.getnspval = gethiddenproperty
 
 		env.getbspval = function(obj, prop, encode)
-			local value = gethiddenproperty(obj, prop)
+			local ok, value = pcall(gethiddenproperty, obj, prop)
 
-			if value == nil then
+			if not ok or value == nil then
 				return nil
 			end
 
-			if encode then
+			if encode and crypt and type(crypt.base64encode) == "function" then
 				return crypt.base64encode(value)
 			end
 
 			return value
 		end
+
+		env.setrbxclipboard = setrbxclipboard
 
 		------------------------------------------------------------
 		-- Potassium crypto
